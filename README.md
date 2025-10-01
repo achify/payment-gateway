@@ -1,107 +1,125 @@
-# Payment Gateway API
+# Payment Gateway API (Go)
 
-This project demonstrates a layered payment gateway API that separates domain logic from infrastructure concerns. It exposes endpoints for quoting cross-border transfers and initiating payouts while keeping dependencies behind interfaces to enable testing and future integrations.
+This project models a payment gateway that can quote foreign exchange transfers and initiate payouts while keeping business
+logic isolated from delivery and infrastructure details. The implementation is written in Go and demonstrates SOLID-friendly
+composition, clean layering, and strong reliance on interfaces so that databases, Kafka, and other integrations can be
+exchanged without touching the domain.
 
-## Architecture Overview
+## Architecture
 
-The codebase follows SOLID principles and a clean architecture inspired structure:
+```
+cmd/server              -> application wiring & HTTP bootstrap
+internal/
+  application/          -> use-case services and DTOs
+    ports/              -> interfaces for infrastructure dependencies
+  domain/               -> entities, value objects, and domain errors
+  http/                 -> HTTP handlers that adapt requests/responses
+  infrastructure/       -> in-memory adapters for exchange rates, fees, wallets, payouts, and events
+```
 
-- **Domain layer (`src/domain`)** – value objects, entities, and domain-specific errors.
-- **Application layer (`src/application`)** – orchestrates use cases through services and works only with interfaces defined under `ports`.
-- **Infrastructure layer (`src/infrastructure`)** – adapters that implement the ports (e.g., in-memory exchange rates, wallet repository, payout processor, event publisher, fee policy).
-- **HTTP layer (`src/http`)** – Express routes that translate HTTP requests/responses into use-case invocations.
+Key principles:
 
-The services depend on interfaces (`ExchangeRateProvider`, `WalletRepository`, `PayoutProcessor`, `EventPublisher`, `FeePolicy`), making it straightforward to swap implementations for actual databases or messaging systems.
+- **Segregation of concerns** – each layer has a single responsibility; handlers only translate transport concerns, services
+  implement business rules, and infrastructure contains integrations.
+- **Dependency inversion** – application services depend only on interfaces declared under `internal/application/ports`.
+- **Testability** – in-memory adapters make it straightforward to unit test success/failure paths and to swap in fakes during
+  integration or end-to-end tests.
 
-## Endpoints
+## Running the service
 
-| Method | Path | Description |
-| ------ | ---- | ----------- |
-| `POST` | `/api/transfers/calculate` | Returns an FX quote, fee, and wallet debit total. |
-| `POST` | `/api/payouts` | Initiates a payout using a previously calculated quote. |
+```bash
+go run ./cmd/server
+```
 
-### Transfer calculation request
+The server listens on `http://localhost:8080`.
+
+### Transfer quote
+
+`POST /transfer/quote`
 
 ```json
 {
   "sourceCurrency": "GBP",
   "targetCurrency": "NGN",
-  "amount": 50
+  "amount": "50"
 }
 ```
 
-### Transfer calculation response
+Response
 
 ```json
 {
-  "exchangeRate": 2100,
-  "amountToSend": { "amount": 50, "currency": "GBP" },
-  "amountToReceive": { "amount": 105000, "currency": "NGN" },
-  "fee": { "amount": 1.99, "currency": "GBP" },
-  "totalDebit": { "amount": 51.99, "currency": "GBP" }
+  "canTransact": true,
+  "exchangeRate": "2100",
+  "sendAmount": { "currency": "GBP", "amount": "50.00" },
+  "receiveAmount": { "currency": "NGN", "amount": "105000.00" },
+  "fee": { "currency": "GBP", "amount": "1.99" },
+  "totalDebit": { "currency": "GBP", "amount": "51.99" }
 }
 ```
 
-### Payout request
+### Initiate payout
+
+`POST /payouts`
 
 ```json
 {
-  "walletId": "wallet-gbp-1",
-  "amount": 50,
-  "sourceCurrency": "GBP",
-  "targetCurrency": "NGN",
-  "reference": "INV-2024-05",
+  "walletId": "wallet-123",
+  "currency": "GBP",
+  "amount": "50",
+  "reference": "client-ref-1",
   "destination": {
     "type": "bank_account",
-    "bank": {
-      "country": "NG",
-      "bankCode": "044",
-      "accountNumber": "1234567890",
-      "accountName": "John Doe"
-    }
+    "accountNumber": "1234567890",
+    "bankCode": "999",
+    "bankName": "Demo Bank",
+    "country": "NG",
+    "currency": "NGN",
+    "recipientName": "John Doe"
   }
 }
 ```
 
-### Payout response
+Response
 
 ```json
 {
-  "payoutId": "...",
-  "status": "pending",
-  "quote": { /* same structure as the calculation response */ },
-  "walletBalance": 48.01
+  "payoutId": "payout-000001",
+  "quote": { /* same structure as transfer quote */ },
+  "remainingBalance": { "currency": "GBP", "amount": "48.01" }
 }
 ```
 
-## Running the project
-
-```bash
-npm install
-npm run dev
-```
-
-The API will be available on `http://localhost:3000`.
-
 ## Testing
 
-Unit tests are provided for both transfer calculations and payout initiation:
-
 ```bash
-npm test
+go test ./...
 ```
 
-The tests cover success paths and failure scenarios such as unsupported currency pairs, invalid amounts, and insufficient funds.
+Unit tests cover:
 
-## Replacing infrastructure dependencies
+- successful transfer quote calculation with fee application
+- payout initiation happy path (debit, processor call, event emission)
+- failures for unsupported currency pairs, processor errors, and insufficient wallet funds
 
-- **Database access** – swap the `InMemoryWalletRepository` implementation for one that reads/writes to a persistent store (e.g., PostgreSQL). All interactions with the database are isolated within the repository.
-- **Kafka publishing** – replace `LoggingEventPublisher` with a Kafka-backed publisher. `PayoutService` only depends on the `EventPublisher` interface, so the change is limited to wiring.
+These tests are inexpensive and can be extended into E2E tests by swapping the in-memory adapters for HTTP/Kafka fakes.
 
-## Design trade-offs & bottlenecks
+## Infrastructure touchpoints & trade-offs
 
-- **Precision** – For brevity, amounts are handled as JavaScript numbers. In production, use a decimal library to avoid rounding issues.
-- **Idempotency** – The payout endpoint assumes single invocation. Real systems should add idempotency keys and retry-safe processor implementations.
-- **Concurrency** – The in-memory wallet repository is single-threaded. A real database implementation would need proper locking/transactions.
-- **External integrations** – Stubbing the payout processor and publisher keeps the example simple while showing where real HTTP/Kafka clients would plug in.
+- **Database bottleneck** – the `WalletRepository` interface is the single place that would hit a persistent data store. The
+  in-memory implementation mimics optimistic locking by copying structs; a real implementation should use transactions or row
+  locks to avoid double spending.
+- **Kafka integration** – events flow through the `EventPublisher` interface. Replacing the logging publisher with a Kafka
+  producer centralises the change to one adapter while keeping business logic untouched. Back-pressure and delivery semantics
+  (at-least vs. exactly-once) are the main trade-offs to evaluate.
+- **Monetary precision** – the domain uses `shopspring/decimal` to avoid floating point rounding. Production systems should
+  persist amounts in minor units and enforce currency-specific precision.
+- **Idempotency & retries** – payout orchestration assumes a single successful call. Real gateways add idempotency keys, retry
+  policies, and saga orchestration when dealing with external processors and message brokers.
 
+## Extending the system
+
+- Swap `InMemoryWalletRepository` for a PostgreSQL implementation that satisfies `WalletRepository`.
+- Replace `LoggingEventPublisher` with a Kafka-backed publisher to stream payout lifecycle events.
+- Implement additional fee policies (percentage tiers, partner overrides) by creating new structs that satisfy `FeePolicy`.
+- Add authentication, request tracing, and observability middlewares without touching the application layer.
